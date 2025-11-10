@@ -43,7 +43,7 @@ int main(int argc, char** argv) {
         std::cout << "=== Запущено процессов: " << size << " ===\n";
         
         // Тест с матрицей 3x3
-        int n1 = 3, n2 = 3;
+        int n1 = 4, n2 = 4;
         std::vector<double> A(n1 * n1), B(n2 * n2), C(n1 * n2, 0);
         
         fillRandom(A.data(), n1);
