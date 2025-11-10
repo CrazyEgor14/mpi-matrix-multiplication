@@ -1,16 +1,14 @@
 #include <iostream>
 #include <vector>
 #include <random>
+#include <chrono>
 #include <mpi.h>
 
-constexpr int N1 = 3;  // Первая матрица 3x3
-constexpr int N2 = 4;  // Вторая матрица 4x4
-
-void fillRandom(double* mat, int rows, int cols) {
+void fillRandom(double* mat, int size) {
     std::random_device rd;
     std::mt19937 gen(rd());
-    std::uniform_int_distribution<> dis(1, 5);
-    for (int i = 0; i < rows * cols; i++) mat[i] = dis(gen);
+    std::uniform_int_distribution<> dis(1, 9);
+    for (int i = 0; i < size * size; i++) mat[i] = dis(gen);
 }
 
 void printMatrix(double* mat, int rows, int cols, const char* name) {
@@ -20,6 +18,135 @@ void printMatrix(double* mat, int rows, int cols, const char* name) {
             std::cout << mat[i * cols + j] << " ";
         std::cout << "\n";
     }
+    std::cout << "\n";
+}
+
+void singleThreadMultiply(double* A, double* B, double* C, int n1, int n2) {
+    for (int i = 0; i < n1; i++) {
+        for (int j = 0; j < n2; j++) {
+            C[i * n2 + j] = 0;
+            for (int k = 0; k < n1; k++) {
+                C[i * n2 + j] += A[i * n1 + k] * B[k * n2 + j];
+            }
+        }
+    }
+}
+
+void multiThreadMultiply(int rank, int size, double* A, double* B, double* C, int n1, int n2) {
+    if (rank == 0) {
+        // Рассылаем матрицу B всем процессам
+        for (int i = 1; i < size; i++) {
+            MPI_Send(B, n2 * n2, MPI_DOUBLE, i, 0, MPI_COMM_WORLD);
+        }
+        
+        // Распределяем строки матрицы A
+        for (int i = 1; i < size; i++) {
+            int start_row = (i - 1) * n1 / (size - 1);
+            int end_row = i * n1 / (size - 1);
+            int rows_to_send = end_row - start_row;
+            
+            // Отправляем количество строк
+            MPI_Send(&rows_to_send, 1, MPI_INT, i, 1, MPI_COMM_WORLD);
+            // Отправляем стартовую строку
+            MPI_Send(&start_row, 1, MPI_INT, i, 2, MPI_COMM_WORLD);
+            // Отправляем сами строки
+            for (int r = 0; r < rows_to_send; r++) {
+                MPI_Send(&A[(start_row + r) * n1], n1, MPI_DOUBLE, i, 3, MPI_COMM_WORLD);
+            }
+        }
+        
+        // Процесс 0 тоже вычисляет свою часть
+        int start_row0 = (size - 1) * n1 / (size - 1);
+        int rows0 = n1 - start_row0;
+        for (int i = 0; i < rows0; i++) {
+            for (int j = 0; j < n2; j++) {
+                C[(start_row0 + i) * n2 + j] = 0;
+                for (int k = 0; k < n1; k++) {
+                    C[(start_row0 + i) * n2 + j] += A[(start_row0 + i) * n1 + k] * B[k * n2 + j];
+                }
+            }
+        }
+        
+        // Получаем результаты от других процессов
+        for (int i = 1; i < size; i++) {
+            int rows_to_receive;
+            MPI_Recv(&rows_to_receive, 1, MPI_INT, i, 4, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            
+            int start_row;
+            MPI_Recv(&start_row, 1, MPI_INT, i, 5, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            
+            for (int r = 0; r < rows_to_receive; r++) {
+                MPI_Recv(&C[(start_row + r) * n2], n2, MPI_DOUBLE, i, 6, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            }
+        }
+    } else {
+        // Получаем матрицу B
+        MPI_Recv(B, n2 * n2, MPI_DOUBLE, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        
+        // Получаем информацию о строках
+        int rows_to_process;
+        MPI_Recv(&rows_to_process, 1, MPI_INT, 0, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        
+        int start_row;
+        MPI_Recv(&start_row, 1, MPI_INT, 0, 2, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        
+        // Получаем строки матрицы A
+        std::vector<double> my_rows(rows_to_process * n1);
+        for (int r = 0; r < rows_to_process; r++) {
+            MPI_Recv(&my_rows[r * n1], n1, MPI_DOUBLE, 0, 3, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        }
+        
+        // Вычисляем результат
+        std::vector<double> my_result(rows_to_process * n2);
+        for (int i = 0; i < rows_to_process; i++) {
+            for (int j = 0; j < n2; j++) {
+                my_result[i * n2 + j] = 0;
+                for (int k = 0; k < n1; k++) {
+                    my_result[i * n2 + j] += my_rows[i * n1 + k] * B[k * n2 + j];
+                }
+            }
+        }
+        
+        // Отправляем результаты обратно
+        MPI_Send(&rows_to_process, 1, MPI_INT, 0, 4, MPI_COMM_WORLD);
+        MPI_Send(&start_row, 1, MPI_INT, 0, 5, MPI_COMM_WORLD);
+        for (int r = 0; r < rows_to_process; r++) {
+            MPI_Send(&my_result[r * n2], n2, MPI_DOUBLE, 0, 6, MPI_COMM_WORLD);
+        }
+    }
+}
+
+void runTest(int matrix_size, bool use_mpi, int num_processes) {
+    int n1 = matrix_size;
+    int n2 = matrix_size;
+    
+    std::vector<double> A(n1 * n1), B(n2 * n2), C(n1 * n2, 0);
+    
+    fillRandom(A.data(), n1);
+    fillRandom(B.data(), n2);
+    
+    std::cout << "=== Матрица " << n1 << "x" << n1 << " - " 
+              << (use_mpi ? "Многопоточный подход" : "Однопоточный подход") << " ===\n";
+    
+    auto start = std::chrono::high_resolution_clock::now();
+    
+    if (use_mpi) {
+        multiThreadMultiply(0, num_processes, A.data(), B.data(), C.data(), n1, n2);
+    } else {
+        singleThreadMultiply(A.data(), B.data(), C.data(), n1, n2);
+    }
+    
+    auto end = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+    
+    if (!use_mpi || (use_mpi && num_processes == 1)) {
+        printMatrix(A.data(), n1, n1, "Матрица A");
+        printMatrix(B.data(), n2, n2, "Матрица B");
+        printMatrix(C.data(), n1, n2, "Результат C");
+    }
+    
+    std::cout << "Время выполнения: " << duration.count() << " микросекунд\n";
+    std::cout << "========================================\n\n";
 }
 
 int main(int argc, char** argv) {
@@ -29,94 +156,60 @@ int main(int argc, char** argv) {
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
     
-    std::vector<double> A(N1 * N1), B(N2 * N2), C(N1 * N2, 0);
-    
     if (rank == 0) {
-        fillRandom(A.data(), N1, N1);
-        fillRandom(B.data(), N2, N2);
-        printMatrix(A.data(), N1, N1, "Matrix A (3x3)");
-        printMatrix(B.data(), N2, N2, "Matrix B (4x4)");
-    }
-    
-    // Рассылаем матрицу B всем процессам
-    MPI_Bcast(B.data(), N2 * N2, MPI_DOUBLE, 0, MPI_COMM_WORLD);
-    
-    // Распределяем строки матрицы A
-    int rows_per_proc = N1 / size;
-    int extra_rows = N1 % size;
-    int my_rows = rows_per_proc + (rank < extra_rows ? 1 : 0);
-    int start_row = 0;
-    
-    // Вычисляем стартовую строку для каждого процесса
-    for (int i = 0; i < rank; i++) {
-        start_row += rows_per_proc + (i < extra_rows ? 1 : 0);
-    }
-    
-    std::vector<double> my_part(my_rows * N1);
-    
-    // Распределяем строки матрицы A
-    if (rank == 0) {
-        // Процесс 0 копирует свою часть
-        for (int i = 0; i < my_rows; i++) {
-            for (int j = 0; j < N1; j++) {
-                my_part[i * N1 + j] = A[(start_row + i) * N1 + j];
-            }
-        }
-        // Отправляем остальным процессам их части
-        for (int p = 1; p < size; p++) {
-            int p_rows = rows_per_proc + (p < extra_rows ? 1 : 0);
-            int p_start = 0;
-            for (int i = 0; i < p; i++) p_start += rows_per_proc + (i < extra_rows ? 1 : 0);
-            
-            for (int r = 0; r < p_rows; r++) {
-                MPI_Send(&A[(p_start + r) * N1], N1, MPI_DOUBLE, p, 0, MPI_COMM_WORLD);
-            }
-        }
+        std::cout << "Количество процессов: " << size << "\n\n";
+        
+        // Вариант 1: Многопоточный подход с матрицей 3x3
+        runTest(3, true, size);
+        
+        // Вариант 2: Однопоточный подход с матрицей 3x3  
+        runTest(3, false, 1);
+        
+        // Вариант 3: Многопоточный подход с матрицей 4x4
+        runTest(4, true, size);
+        
+        // Вариант 4: Однопоточный подход с матрицей 4x4
+        runTest(4, false, 1);
     } else {
-        // Получаем свои строки от процесса 0
-        for (int r = 0; r < my_rows; r++) {
-            MPI_Recv(&my_part[r * N1], N1, MPI_DOUBLE, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-        }
-    }
-    
-    // Каждый процесс умножает свои строки на матрицу B
-    std::vector<double> my_result(my_rows * N2, 0);
-    for (int i = 0; i < my_rows; i++) {
-        for (int j = 0; j < N2; j++) {
-            for (int k = 0; k < N1; k++) {
-                my_result[i * N2 + j] += my_part[i * N1 + k] * B[k * N2 + j];
-            }
-        }
-    }
-    
-    // Собираем результаты в процессе 0
-    if (rank == 0) {
-        // Копируем результат процесса 0
-        for (int i = 0; i < my_rows; i++) {
-            for (int j = 0; j < N2; j++) {
-                C[(start_row + i) * N2 + j] = my_result[i * N2 + j];
-            }
-        }
-        // Получаем результаты от других процессов
-        for (int p = 1; p < size; p++) {
-            int p_rows = rows_per_proc + (p < extra_rows ? 1 : 0);
-            int p_start = 0;
-            for (int i = 0; i < p; i++) p_start += rows_per_proc + (i < extra_rows ? 1 : 0);
+        // Рабочие процессы
+        for (int test = 0; test < 2; test++) { // Два многопоточных теста
+            std::vector<double> B(16); // Максимальный размер 4x4
             
-            std::vector<double> p_result(p_rows * N2);
-            MPI_Recv(p_result.data(), p_rows * N2, MPI_DOUBLE, p, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            // Получаем матрицу B
+            MPI_Recv(B.data(), 16, MPI_DOUBLE, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
             
-            for (int i = 0; i < p_rows; i++) {
-                for (int j = 0; j < N2; j++) {
-                    C[(p_start + i) * N2 + j] = p_result[i * N2 + j];
+            // Получаем информацию о строках
+            int rows_to_process, start_row;
+            MPI_Recv(&rows_to_process, 1, MPI_INT, 0, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            MPI_Recv(&start_row, 1, MPI_INT, 0, 2, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            
+            // Получаем строки матрицы A
+            std::vector<double> my_rows(rows_to_process * 4); // Максимальный размер
+            for (int r = 0; r < rows_to_process; r++) {
+                MPI_Recv(&my_rows[r * 4], 4, MPI_DOUBLE, 0, 3, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            }
+            
+            // Вычисляем результат
+            std::vector<double> my_result(rows_to_process * 4);
+            int n1 = 4; // Максимальный размер
+            int n2 = 4;
+            
+            for (int i = 0; i < rows_to_process; i++) {
+                for (int j = 0; j < n2; j++) {
+                    my_result[i * n2 + j] = 0;
+                    for (int k = 0; k < n1; k++) {
+                        my_result[i * n2 + j] += my_rows[i * n1 + k] * B[k * n2 + j];
+                    }
                 }
             }
+            
+            // Отправляем результаты обратно
+            MPI_Send(&rows_to_process, 1, MPI_INT, 0, 4, MPI_COMM_WORLD);
+            MPI_Send(&start_row, 1, MPI_INT, 0, 5, MPI_COMM_WORLD);
+            for (int r = 0; r < rows_to_process; r++) {
+                MPI_Send(&my_result[r * n2], n2, MPI_DOUBLE, 0, 6, MPI_COMM_WORLD);
+            }
         }
-        
-        printMatrix(C.data(), N1, N2, "Result C (3x4)");
-    } else {
-        // Отправляем результаты процессу 0
-        MPI_Send(my_result.data(), my_rows * N2, MPI_DOUBLE, 0, 1, MPI_COMM_WORLD);
     }
     
     MPI_Finalize();
