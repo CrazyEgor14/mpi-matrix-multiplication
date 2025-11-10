@@ -1,4 +1,3 @@
-makefile
 CXX = mpic++
 TARGET = matrix_simple
 SOURCE = matrix_simple.cpp
